@@ -58,10 +58,100 @@ static uint32_t snd_rpi_hifiberry_digi_enable_clock(int sample_rate)
 	}
 }
 
+static void snd_rpi_hifiberry_digi_proc_rx_rate(struct snd_info_entry *entry,
+						struct snd_info_buffer *buffer)
+{
+	struct snd_soc_codec *codec = entry->private_data;
+	unsigned int rx_rate = 0;
+	unsigned int reg = 0;
+	unsigned int unlock = 0;
+	const unsigned int iec60958_3_frequencies[] =
+	{ 44100, 0,  48000, 32000, /* 0 1 2 3 */
+	      0, 0,      0,     0, /* 4 5 6 7 */
+	  88200, 0,  96000,     0, /* 8 9 a b */
+	 176400, 0, 192000,     0  /* c d e f */ };
+
+	/*
+	 * Returns the locked sample rate of the WM8804 SPDIF/TOSLINK receiver.
+	 * If it is not already locked on an input, setup up the receiver
+	 * in the configuration required to operate the detection
+	 *
+	 * Returns 0 zero until an input rate is detected
+	 * 176 kHz and 192 kHz detection are not functionning yet
+	 */
+
+	/* read SPDSTAT */
+	reg = snd_soc_read(codec, WM8804_SPDSTAT);
+	unlock = (reg >> 6) & 0x1;
+
+	if (unlock) {
+		/*
+		 * Disable AIF to force stop recording at an erroneous sample
+		 * rate since at higher rates the PLL config change introduces
+		 * clicks in the signal captured.
+		 *
+		 * This approach might not be the best because it would also
+		 * interrupt playback if both capture and playback are running
+		 * simultaneously.
+		 * If this is removed, then an application relying on the
+		 * detection must stop its capture as soon as the rate was
+		 * observed to change to 0 or another sample rate to avoid
+		 * audio clicks, pops or other noises potentially risky for
+		 * hearing or speaker's health.
+		 */
+		snd_soc_update_bits(codec, WM8804_PWRDN, 1 << 4, 1 << 4);
+
+		/* set PLL params for < 192 kHz detection */
+		/* prescale: 1 */
+		snd_soc_update_bits(codec, WM8804_PLL4, 1 << 4, 1 << 4);
+		/* PLL_K: 3F19E5 */
+		snd_soc_update_bits(codec, WM8804_PLL1, 0xff, 0xE5);
+		snd_soc_update_bits(codec, WM8804_PLL2, 0xff, 0x19);
+		snd_soc_update_bits(codec, WM8804_PLL3, 0x3f, 0x3f);
+		/* PLL_N: 6 */
+		snd_soc_update_bits(codec, WM8804_PLL4, 0xf, 0x6);
+
+		/*
+		 * PLL params for 192kHz detection:
+		 * (not working in my tests so far)
+		 */
+
+		/* prescale: 1 */
+		/* snd_soc_update_bits(codec, WM8804_PLL4, 1 << 4, 1 << 4); */
+		/* PLL_K: 1208A5 */
+		/*
+		snd_soc_update_bits(codec, WM8804_PLL1, 0xff, 0xA5);
+		snd_soc_update_bits(codec, WM8804_PLL2, 0xff, 0x08);
+		snd_soc_update_bits(codec, WM8804_PLL3, 0x3f, 0x12);
+		*/
+		/* PLL_N: 7 */
+		/* snd_soc_update_bits(codec, WM8804_PLL4, 0xf, 0x7); */
+
+		/* Set PLL to fractional mode */
+		snd_soc_update_bits(codec, WM8804_PLL5, 0x04, 0x04);
+
+		/* Enable PLL */
+		snd_soc_update_bits(codec, WM8804_PWRDN, 0x01, 0x0);
+
+		/* enable SPDIF/TOSLINK RX */
+		snd_soc_update_bits(codec, WM8804_PWRDN, 0x02, 0x3d);
+	}
+
+	/* read SPDSTAT again */
+	reg = snd_soc_read(codec, WM8804_SPDSTAT);
+	unlock = (reg >> 6) & 0x1;
+	if (!unlock) {
+		reg = snd_soc_read(codec, WM8804_RXCHAN4);
+		rx_rate = iec60958_3_frequencies[reg & 0xf];
+	}
+
+	snd_iprintf(buffer, "%d\n", rx_rate);
+}
 
 static int snd_rpi_hifiberry_digi_init(struct snd_soc_pcm_runtime *rtd)
 {
 	struct snd_soc_codec *codec = rtd->codec;
+	struct snd_info_entry *entry;
 
 	/* enable TX output */
 	snd_soc_update_bits(codec, WM8804_PWRDN, 0x4, 0x0);
@@ -72,6 +162,11 @@ static int snd_rpi_hifiberry_digi_init(struct snd_soc_pcm_runtime *rtd)
 
 		dai->name = "HiFiBerry Digi+ Pro";
 		dai->stream_name = "HiFiBerry Digi+ Pro HiFi";
+	}
+
+	if (!snd_card_proc_new(rtd->card->snd_card, "rx_rate", &entry)) {
+		snd_info_set_text_ops(entry, rtd->codec,
+				      snd_rpi_hifiberry_digi_proc_rx_rate);
 	}
 
 	return 0;
